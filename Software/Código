@@ -1,1 +1,610 @@
-pene
+/*****************************************************************************************************************************************************
+*                                                           FILAMENTO DE BOTELLAS                                                                    *
+*                                                       *****************************                                                                *
+* VERSIÓN 1.3                                                                                                                                        *
+* 22/9/2024                                                                                                                                          *
+*                                                                                                                                *
+*****************************************************************************************************************************************************/
+
+#include "io430.h"
+#include "LCD.h"
+#include "DELAY.h"
+#include "Tipos.h"
+#include "FLASH.h"
+
+/****************************************************************************************************************************************************/
+
+#define Enable_Interrupts     __bis_SR_register(GIE)
+#define Disable_Interrupts    __bic_SR_register(GIE)
+#define Enable_IrqTimer0        TACTL0|=TAIE
+#define Disable_IrqTimer0       TACTL0&=~TAIE
+#define Enable_IrqTeclas        P2IE=0x07
+#define Disable_IrqTeclas       P2IE=0
+
+/******************************************************* DEFINICIÓN DE CONEXIONES *******************************************************************/
+
+#define ENABLE 0x80
+#define SENSOR_FIL (P2IN & 0x08)
+#define BUZZER 0x40
+#define CALEFACTOR 0x01
+
+/**************************************************************** ACCIONES **************************************************************************/
+
+#define BUZZER_ON               P2OUT |= BUZZER
+#define BUZZER_OFF              P2OUT &= ~BUZZER
+#define CALEFACTOR_ON           P1OUT |= CALEFACTOR
+#define CALEFACTOR_OFF          P1OUT &= ~CALEFACTOR
+#define MOTOR_OFF               P2OUT |= ENABLE
+#define MOTOR_ON                P2OUT &= ~ENABLE
+#define ACTIVA_TRACCION         TA1CTL |= MC0
+#define DESACTIVA_TRACCION      TA1CTL &= ~MC0
+#define ACTIVA_CONTROL_TEMP     TA0CTL |= (MC1 + TAIE)
+#define DESACTIVA_CONTROL_TEMP  TA0CTL &= ~(MC1 + TAIE)
+
+
+#define T_BEEP_CORTO        50
+#define T_BEEP_LARGO        300
+
+
+/******************************************************** PROTOTIPOS DE FUNCIONES *******************************************************************/
+
+void Beep_corto(void);          
+void Beep_largo(void);
+unsigned int Medir(void);       // TOMA MEDICIONES CON EL A/D
+int MideTemp();                 // CALCULA LA TEMPERATURA MEDIDA
+void ActivaMotor (void);
+void DesactivaMotor(void);              
+void Dormir(void);              // MODO BAJO CONSUMO
+void pantalla_1(void);
+void pantalla_2(void);
+void pantalla_3(void);
+void pantalla_5(void);
+void Read_Status(void);         // LECTURA DE DATOS DE LA FLASH
+void Status_Backup(void);       // ESCRITURA DE DATOS EN LA FLASH
+
+/************************************************************ VARIABLES GLOBALES ********************************************************************/
+
+int *Base_addr = (int*)0xfc00;            // INICIO DEL BLOQUE DE FLASH PARA USAR COMO EEPROM
+int *Save_addr;
+byte temperatura, velocidad;
+byte tecla=0;
+int t_out = 0;
+const int AD[] = {13,39,93,185,314,465,612,738,826,890};                                     // LECTURAS DEL A/D CADA 25°C (CALIBRACIÓN DEL TERMISTOR)
+const int velTimer[] = {15360,14260,13160,12060,10970,9870,8770,7680,6580,5480,4390};        // VALORES DEL TIMER PARA CONTROL DE VELOCIDAD
+const int HISTERESIS = 0;                                                               // SEPARACIÓN ENTRE EL APAGADO Y ENCENDIDO DEL CALEFACTOR [°C]
+int tempMedida = 0;
+
+/****************************************************************************************************************************************************/
+/****************************************************************************************************************************************************/
+/****************************************************************************************************************************************************/
+
+int main( void )
+{
+ 
+ WDTCTL = WDTPW + WDTHOLD;              // DESHABILITO EL WATCHDOG TIMER PARA PREVENIR RESET
+ Disable_Interrupts;
+ 
+ /******************************************************* CONFIGURACIÓN DEL CLK *********************************************************************/
+
+  /* 
+  * Basic Clock System Control 2
+  * 
+  * SELM_0 -- DCOCLK
+  * DIVM_0 -- Divide by 1
+  * ~SELS -- DCOCLK
+  * DIVS_0 -- Divide by 1
+  * ~DCOR -- DCO uses internal resistor
+  * 
+  * Note: ~<BIT> indicates that <BIT> has value zero
+  */
+
+  BCSCTL2 = 0x00; /* Conecto MCLK y SMCLK al DCO y divisores en 1 en ambos*/
+  DCOCTL = 0x00;
+  BCSCTL1 = CALBC1_12MHZ;     /* Set DCO to 12MHz */
+  DCOCTL = CALDCO_12MHZ;
+
+  /* 
+  * Basic Clock System Control 1
+  * 
+  * XT2OFF -- Disable XT2CLK
+  * ~XTS -- Low Frequency
+  * DIVA_0 -- Divide by 1
+  * 
+  * Note: ~XTS indicates that XTS has value zero
+  */
+  BCSCTL1 |= XT2OFF | DIVA_0;
+
+  /* 
+  * Basic Clock System Control 3
+  * 
+  * XT2S_0 -- 0.4 - 1 MHz
+  * LFXT1S_2 -- If XTS = 0, XT1 = VLOCLK ; If XTS = 1, XT1 = 3-16-MHz crystal 
+  * XCAP_1 -- ~6 pF
+  */
+  BCSCTL3 = XT2S_0 | LFXT1S_2 | XCAP_1;
+ 
+/********************************************************* CONFIGURACIÓN DE PUERTOS DE E/S **********************************************************/
+  
+  /* Port 1 Output Register */
+  P1OUT = 0;
+
+  /* Port 1 Direction Register */
+  P1DIR = BIT0 | BIT2 | BIT3 | BIT4 | BIT5 | BIT6 | BIT7; /* Salvo el PIN 1, el resto salidas */
+  
+  /* Pull up/dowmn */
+  P1REN = 0;            // SIN PULL UP/DOWN   
+
+  /* Port 1 Interrupt Flag Register */
+  P1IFG = 0;
+
+  P1OUT = 0;
+    
+  /* Port 2 Output Register */
+  P2OUT = 0;
+
+  /* Port 2 Port Select Register */
+  P2SEL = 0;
+  P2SEL2 = 0;
+  P2SEL |= BIT4;        // SELECCIONO LA FUNCIÓN SECUNDARIA P2.4 (TA1.2)
+
+  /* Port 2 Direction Register */
+  P2DIR =  BIT4 | BIT5 | BIT6 | BIT7;
+  
+  P2REN = BIT0 | BIT1 | BIT2 | BIT3;
+  
+  P2OUT = 0x0f;         //PULL UP EN P2.0:3 (PULSADORES Y SENSOR DE FILAMENTO)
+
+  /* Port 2 Interrupt Flag Register */
+  P2IFG = 0;
+  
+  /* Port 2 Interrupt Edge Select */
+  P2IES = 0x07;         // PULSADORES GENERAN IRQ CON FLANCO DESCENDENTE
+  
+  P2IE = 0x07;          // HABILITO INTERRUPCIONES EN LAS ENTRADAS CORRESPONDIENTES
+
+  
+ /********************************************************** CONFIGURACIÓN DEL A/D ******************************************************************/
+  
+  ADC10CTL0 = 0x1c00; 
+  ADC10CTL1 = 0x10f8;                       // input A1
+  ADC10AE0 |= 0x0002;                       // PA.1 ADC option select
+ 
+ /********************************************************** CONFIGURACIÓN DE TIMERS ****************************************************************/
+
+ // Configuración del Timer_A0 para generar IRQ y chequear temperatura
+  
+  TA0CTL = TASSEL1 | ID1 | ID0 | TAIE;
+  TA0CCR0 = 0xffff;
+  
+  
+  // Configuración del TimerB o Timer1_A para PWM en P2.4 (TA1.2)
+  
+  TA1CTL = TASSEL1 | ID1 | ID0; /* SMCLK como fuente dividido por 8 */
+  
+  /* TA0CCR0, Timer_A Capture/Compare Register 0 */
+  TA1CCR0 = 0; 
+  TA1CCR2 = 0;
+  TA1CCTL2|= OUTMOD2;    /* Modo COMPARE, salida en TOGGLE */ 
+  
+  
+  MOTOR_OFF;
+  
+  Save_addr = Base_addr;        // La primera dirección es la dirección base
+  
+  // Configuración inicial de la pantalla
+  
+  extern logic Bus;
+  BUS4;
+  Inicializa();
+  Retardo_ms (500);
+  Inicializa();
+  Borra();
+  Modo(CONT_ASCENDENTE, DISP_QUIETO);
+  Control(DISPLAY_ON,CURSOR_OFF,BLINK_OFF);
+  Retardo_ms(250);
+  pantalla_1();
+  tecla = 0;
+  Enable_Interrupts;
+  Retardo_ms(2000);
+  if (tecla==3){                                                // Si mantengo presionada la tecla 3 en el encendido restablezco valores por defecto
+    temperatura = 200;
+    velocidad = 10;
+    Status_Backup();
+    Borra();
+    Lcd(1,1,"CONFIGURACION");
+    Lcd(2,1,"RESTABLECIDA");
+    Beep_largo();
+    tecla=0;
+    Retardo_ms(5000);
+  }
+  else {
+    Read_Status();
+    if (temperatura<180 || temperatura>240)
+      temperatura = 200;
+    if (velocidad<5 || velocidad>15)
+      velocidad = 10;
+    Beep_largo();
+  }
+  
+  TA1CCR0 = velTimer[velocidad-5];
+
+  // Loop principal
+  
+  Borra();
+  Enable_Interrupts;
+  while(1){
+    pantalla_2();
+  }
+}
+// FUNCIONES
+
+void pantalla_1(void){                                          // Pantalla de inicio
+  Borra();
+  Lcd (1,2,"FILAMENTO POR");
+  Lcd (2,0,"PULTRUSION  V1.3");
+}
+
+void pantalla_2(void){                                          // Pantalla principal
+  tecla=0;
+  Borra();
+  Lcd (1,0,"TEMP:     VEL:");
+  Lcd (2,0,"INICIO    CONFIG");
+  Lcd_num(1,7,temperatura);
+  Lcd_num(1,15,velocidad);
+  Enable_IrqTeclas;
+  Dormir();                                                     // Pone al micro en modo bajo consumo a la espera de alguna tecla
+  switch (tecla){
+  case 1:
+    pantalla_5();
+    break;
+  case 2:
+    break;
+  case 3:
+    pantalla_3();
+    break;
+  }
+  return;
+}
+
+void pantalla_3(void){                                          // Ajuste de temperatura
+  tecla=0;
+  byte bucle = 1;
+  t_out = 0;
+  Borra();
+  Lcd (1,0,"TEMPERAT.:    °C");
+  Lcd (2,0,"SUBE  BAJA  SIG");
+  while(bucle == 1 && t_out < 10){
+    Lcd_num (1,13,temperatura);
+    Enable_IrqTeclas;
+    switch (tecla){
+    case 1:
+      tecla=0;
+      temperatura+=5;
+      if (temperatura > 240)
+        temperatura = 240;
+      Lcd (1,10,"    ");
+      break;
+    case 2:
+      tecla=0;
+      temperatura-=5;
+      if (temperatura < 180)
+        temperatura = 180;
+      Lcd (1,10,"    ");
+      break;
+    case 3:
+      tecla=0;
+      bucle = 0;
+      break;
+      }
+    }
+  if (t_out>=10){
+    t_out=0;
+    Status_Backup();
+    Enable_Interrupts;
+    return;
+  }
+  bucle = 1;
+  t_out=0;
+  Borra();                                                      // Ajuste de velocidad        
+  Lcd (1,0,"VELOCIDAD: ");
+  Lcd (2,0,"SUBE  BAJA  FIN");
+  while(bucle==1 && t_out<10){
+    Lcd_num (1,12,velocidad);
+    Enable_IrqTeclas;
+    switch (tecla){
+      case 1:
+        tecla=0;
+        velocidad +=1;
+        if (velocidad > 15)
+          velocidad = 15;
+        Lcd (1,10,"   ");
+        break;
+      case 2:
+        tecla=0;
+        velocidad-=1;
+        if (velocidad < 5)
+          velocidad = 5;
+        Lcd (1,10,"   ");
+        break;
+      case 3:
+        tecla=0;
+        bucle = 0;
+        break;
+      }
+  }
+  t_out=0;
+  Status_Backup();
+  Enable_Interrupts;
+  return;
+}
+
+
+void pantalla_5(void){                                          // Pantalla calentando
+  byte bucle=1;
+  tecla=0;
+  int medicion=0;
+  Borra();
+  Lcd (1,3,"CALENTANDO");
+  Lcd (2,10,"ABORTA");
+  ACTIVA_CONTROL_TEMP;
+  Enable_IrqTeclas;
+  while ((medicion=MideTemp())<temperatura){
+    Lcd (2,0,"    °C");
+    Lcd_num (2,3,medicion);            
+    if (tecla==3){
+      CALEFACTOR_OFF;
+      DESACTIVA_CONTROL_TEMP;
+      tecla=0;
+      return;
+    }
+    Retardo_ms(300);
+  }
+  Beep_corto();
+  while (1){
+  Borra();                                                      // Atar filamento al tractor
+  Lcd (1,2,"ATE FILAMENTO");
+  Lcd (2,0,"CONT.     ABORTA");
+  bucle = 1;
+  tecla=0;
+  while (bucle){
+    switch (tecla){
+    case 1:
+      if (!SENSOR_FIL)
+        bucle=0;
+      tecla=0;
+      break;
+    case 3:
+      tecla=0;
+      CALEFACTOR_OFF;
+      DESACTIVA_CONTROL_TEMP;
+      return;
+    }
+  }
+  Borra();
+  ActivaMotor();
+  Enable_IrqTeclas;
+  while (!SENSOR_FIL){
+    if (!(P2OUT&ENABLE)){                       // Si no está detenido muestro pantalla de tracción
+      Lcd (1,0,"TRACCION      °C");
+      Lcd_num (1,13,tempMedida);
+      Lcd (2,0,"AJUS. PAUSA  FIN");
+    }
+    switch (tecla){
+    case 1:
+      tecla=0;
+      pantalla_3();
+      Borra();
+      break;
+    case 2:
+      tecla=0;
+      P2OUT ^= ENABLE;
+      if (P2OUT&ENABLE){
+        Lcd (1,0,"                ");
+        Lcd(1,4,"DETENIDO");
+        Lcd(2,0,"      CONT.");
+      }
+      else {
+        Borra();
+     }
+      Retardo_ms(150);
+      break;
+    case 3:
+      tecla=0;
+      DesactivaMotor();
+      DESACTIVA_CONTROL_TEMP;
+      CALEFACTOR_OFF;
+      return;
+    }
+  }
+  tecla=0;
+  DesactivaMotor();  
+  Borra();
+  Lcd (1,0,"** FINALIZADO **");
+  Lcd (2,0,"----------------");
+  for (byte i = 0; i < 5; i++){
+    Beep_largo();
+    Retardo_ms(1000);
+  }
+  Borra();                                                      
+  Lcd (1,0,"RETIRE FILAMENTO");
+  Lcd (2,0,"CONTINUA     FIN");
+  tecla = 0;
+  t_out = 0;
+  Enable_IrqTeclas;
+  while (!tecla && t_out<100){
+    switch (tecla){
+    case 1:
+      break;
+    case 3:
+      tecla=0;
+      DESACTIVA_CONTROL_TEMP;
+      CALEFACTOR_OFF;
+      return;
+    }      
+  }
+  if (t_out>=100){
+      DESACTIVA_CONTROL_TEMP;
+      CALEFACTOR_OFF;
+      for (byte i = 0; i < 5; i++){
+        Beep_corto();
+        Retardo_ms(200);
+      }
+      return;
+  }
+  }
+}
+
+void Beep_corto(void){
+  BUZZER_ON;
+  Retardo_ms(T_BEEP_CORTO);
+  BUZZER_OFF;
+  Retardo_ms(T_BEEP_CORTO);
+  return;
+}
+
+void Beep_largo(void){
+  BUZZER_ON;
+  Retardo_ms(T_BEEP_LARGO);
+  BUZZER_OFF;
+  Retardo_ms(T_BEEP_LARGO);
+  return;
+}
+
+unsigned int Medir(void){
+  ADC10CTL0 |= ADC10ON;                         // ENCIENDO EL A/D
+  Retardo10us();
+  ADC10CTL0 |= (ADC10SC + ENC);                 // HABILITO E INICIO LA CONVERSIÓN
+  while (ADC10CTL1 & ADC10BUSY);
+  ADC10CTL0 &= ~(ADC10ON + ENC);
+  ADC10CTL0 &= ~ADC10ON;
+  return ADC10MEM;
+}
+
+int MideTemp(){
+  unsigned int temp =0;
+  double result,m,b;
+  int n;
+  for (byte i = 0; i<5; i++){                   // Promedio la medida en 5 lecturas para mejorar la estabilidad
+    temp+=Medir();
+    Retardo_ms(5);
+  }
+  temp=temp/5;
+  for(n = 0; AD[n]<temp && n<10; n++);          // Hago interpolación lineal con el valor medido y los datos de calibración
+  if (n==0)
+    return 25;
+  m = 25.0/(AD[n]-AD[n-1]);
+  b = 25.0*(n+1) - m*AD[n];
+  result = m*temp + b;
+  
+  return (int)result;
+}
+
+void ActivaMotor(void){
+  ACTIVA_TRACCION;
+  MOTOR_ON;
+}
+
+void DesactivaMotor(void){
+  DESACTIVA_TRACCION;
+  MOTOR_OFF;
+}
+
+void Dormir(void){
+  Enable_Interrupts;
+  LPM0;
+  return;
+}
+
+  
+//**************************** INTERRUPCIONES ********************************** 
+
+#pragma vector = TIMER1_A1_VECTOR
+__interrupt void Timer1_A1 (void){
+   if (TA1IV == 0x0a)
+    return;
+}
+
+#pragma vector = TIMER0_A1_VECTOR
+__interrupt void Timer0_A1 (void){
+  TA1CCR0 = velTimer[velocidad-5];                // Acá aprovecho y actualizo el PWM
+  static int irqs = 0;
+  irqs++;
+  if (irqs == 20){
+    irqs = 0;
+    tempMedida = MideTemp();                     // Actualizo la medición de temperatura
+    t_out++;
+    if (tempMedida > temperatura + HISTERESIS)
+      CALEFACTOR_OFF;
+    else if (tempMedida < temperatura)
+      CALEFACTOR_ON;  
+  }
+  TA0CTL&= ~TAIFG;                                      // Borro el flag de IRQ
+  return;
+}
+
+#pragma vector = PORT2_VECTOR
+__interrupt void Teclas(void){
+  Disable_IrqTeclas;
+  Beep_corto();
+  Retardo_ms(300);                                      // Para evitar el rebote de contactos
+  switch (P2IFG&0x07){
+  case 1:
+    tecla=1;
+    break;
+  case 2:
+    tecla=2;
+    break;
+  case 4:
+    tecla=3;
+    break;
+  }
+  P2IFG = 0;                                            // Borro los flags
+  Enable_IrqTeclas;
+  LPM0_EXIT;                                            // Despertar
+  return;
+}
+
+//**************************************************************************************************************************
+
+// GRABACIÓN DE PARÁMETROS EN LA FLASH
+
+void Status_Backup (void){
+  int j=0;
+  Save_addr = Base_addr;                              // Inicio la búsqueda desde la primera dirección del bloque
+  BCSCTL1 = CALBC1_1MHZ;     /* Set DCO to 1MHz */    // Hay que bajar el SMCLK para poder grabar
+  DCOCTL = CALDCO_1MHZ;
+  for (j=0;j<256;j++){                                // Recorro el bloque buscando la primera dirección libre (con 0xffff)    
+    if(*(Save_addr+j)== 0xffff){                       // Tener en cuenta que se usan 2 posiciones para cada entero a grabar
+      Save_addr+=j;
+      Flash_Write (Save_addr, temperatura);
+      Save_addr+=1;
+      Flash_Write (Save_addr,velocidad);
+      BCSCTL1 = CALBC1_12MHZ;                         // Reconfiguro el SMCLK a 12MHz.
+      DCOCTL = CALDCO_12MHZ;
+      Retardo10us();
+      return;
+    }
+  }
+  Flash_Erase (Base_addr);                            // Si el bloque está lleno lo borro
+  Save_addr = Base_addr;
+  Flash_Write (Save_addr, temperatura);
+  Save_addr+=1;
+  Flash_Write (Save_addr,velocidad);
+  BCSCTL1 = CALBC1_12MHZ;     /* Set DCO to 12MHz */
+  DCOCTL = CALDCO_12MHZ;
+  Retardo10us();
+  return;
+}
+
+// RECUPERACIÓN DE PARÁMETROS DE LA FLASH
+
+void Read_Status (void){                             // Para recuperar el último backup recorro el bloque hasta encontrar la
+  while (1){                                         // primera posición libre (0xffff) y tomo los 2 anteriores
+    if(*Save_addr == 0xffff){
+      velocidad = *(Save_addr-1);
+      temperatura = *(Save_addr-2);
+      return;
+    }
+    Save_addr++;
+}
+}
